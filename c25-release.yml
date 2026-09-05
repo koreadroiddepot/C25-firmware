@@ -1,0 +1,249 @@
+name: C25 OTA release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Firmware version X.Y.Z (selects existing draft tag vX.Y.Z)'
+        required: true
+        type: string
+      minimum_installed_version:
+        description: 'Minimum installed firmware version X.Y.Z'
+        required: true
+        type: string
+      hardware_revision:
+        description: Compatible hardware revision
+        required: true
+        default: C25-REV-A
+        type: string
+      storage_layout:
+        description: Required storage layout
+        required: true
+        default: C25-AUDIO512-V1
+        type: string
+      release_notes:
+        description: OTA release notes (latest.json notes)
+        required: true
+        type: string
+      mandatory:
+        description: Mandatory OTA update
+        default: false
+        type: boolean
+      publish:
+        description: 'Publish after validation (false = read-only dry run)'
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+# Serialize releases, including runs dispatched from different branches.
+concurrency:
+  group: c25-ota-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # No checkout or third-party action is needed; use the runner's gh/Python.
+      - name: Validate, prepare metadata, optionally publish, and verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUTS_JSON: ${{ toJSON(inputs) }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import struct
+          import subprocess
+          import time
+          from pathlib import Path
+
+          MAX_APP_SIZE = 1_769_472
+          FIRMWARE = "c25-firmware.bin"
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def api(path, method="GET", payload=None, binary=False, upload=None):
+              args = ["gh", "api", path, "--method", method,
+                      "-H", "X-GitHub-Api-Version: 2022-11-28"]
+              if binary:
+                  args += ["-H", "Accept: application/octet-stream"]
+              if upload is not None:
+                  args += ["-H", "Content-Type: application/json", "--input", upload]
+              data = None
+              if payload is not None:
+                  args += ["--input", "-"]
+                  data = json.dumps(payload).encode()
+              result = subprocess.run(args, input=data, capture_output=True, check=True)
+              return result.stdout if binary else json.loads(result.stdout)
+
+          def pages(path):
+              result = []
+              page = 1
+              while True:
+                  batch = api(f"{path}?per_page=100&page={page}")
+                  result.extend(batch)
+                  if len(batch) < 100:
+                      return result
+                  page += 1
+
+          def validate_image(data):
+              require(24 <= len(data) <= MAX_APP_SIZE,
+                      f"APP image must be 24..{MAX_APP_SIZE} bytes")
+              require(data[0] == 0xE9, "Invalid ESP image magic")
+              require(1 <= data[1] <= 16, "Invalid ESP segment count")
+              require(data[23] == 1, "ESP image must contain an appended SHA-256")
+              # ESP header + extended header, followed by segment headers/data.
+              # https://docs.espressif.com/projects/esptool/en/latest/esp32/advanced-topics/firmware-image-format.html
+              offset, checksum = 24, 0xEF
+              for _ in range(data[1]):
+                  require(offset + 8 <= len(data), "Truncated ESP segment header")
+                  length = struct.unpack_from("<I", data, offset + 4)[0]
+                  offset += 8
+                  require(offset + length <= len(data), "Truncated ESP segment data")
+                  for value in data[offset:offset + length]:
+                      checksum ^= value
+                  offset += length
+              checksum_offset = offset + (15 - offset % 16)
+              digest_offset = checksum_offset + 1
+              # C25 accepts a single unsigned APP image, not merged flash dumps,
+              # partition-padded binaries, or Secure Boot signature trailers.
+              require(len(data) == digest_offset + 32,
+                      "Missing digest or unexpected trailing data after ESP image")
+              require(not any(data[offset:checksum_offset]), "Invalid ESP padding")
+              require(data[checksum_offset] == checksum, "ESP checksum mismatch")
+              image_digest = data[digest_offset:digest_offset + 32]
+              require(hashlib.sha256(data[:digest_offset]).digest() == image_digest,
+                      "Appended ESP SHA-256 mismatch")
+              return hashlib.sha256(data).hexdigest(), image_digest.hex()
+
+          def version_tuple(value):
+              require(isinstance(value, str) and
+                      re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value),
+                      "Versions must use X.Y.Z without a v prefix")
+              return tuple(map(int, value.split(".")))
+
+          def one_asset(assets, name):
+              matches = [asset for asset in assets if asset["name"] == name]
+              require(len(matches) == 1, f"Expected exactly one {name}")
+              require(matches[0]["state"] == "uploaded", f"{name} upload is incomplete")
+              return matches[0]
+
+          def main():
+              inputs = json.loads(os.environ["INPUTS_JSON"])
+              version = inputs["version"]
+              require(version_tuple(inputs["minimum_installed_version"]) <= version_tuple(version),
+                      "Minimum installed version exceeds firmware version")
+              for key in ("hardware_revision", "storage_layout", "release_notes"):
+                  require(isinstance(inputs[key], str) and inputs[key].strip(), f"Empty {key}")
+              for key in ("mandatory", "publish"):
+                  require(type(inputs[key]) is bool, f"{key} must be a boolean")
+              tag = f"v{version}"
+              base = f"repos/{os.environ['GITHUB_REPOSITORY']}/releases"
+              matches = [r for r in pages(base) if r["tag_name"] == tag]
+              require(len(matches) == 1, f"Expected one existing release with tag {tag}")
+              release = matches[0]
+              release_path = f"{base}/{release['id']}"
+
+              def get_draft():
+                  current = api(release_path)
+                  require(current["draft"] is True, "Refusing to modify a published release")
+                  require(current["tag_name"] == tag, "Release tag changed during this run")
+                  require(not current["prerelease"], "OTA release must not be a prerelease")
+                  return current
+
+              def asset_list():
+                  return pages(f"{release_path}/assets")
+
+              def download(asset):
+                  data = api(f"{base}/assets/{asset['id']}", binary=True)
+                  require(len(data) == asset["size"], "Downloaded asset size mismatch")
+                  return data
+
+              get_draft()
+              firmware = one_asset(asset_list(), FIRMWARE)
+              require(24 <= firmware["size"] <= MAX_APP_SIZE, "Invalid APP asset size")
+              firmware_data = download(firmware)
+              whole_hash, image_hash = validate_image(firmware_data)
+              metadata = {
+                  "product": "C25",
+                  "hardware": [inputs["hardware_revision"]],
+                  "storage_layout": inputs["storage_layout"],
+                  "version": version,
+                  "minimum_installed_version": inputs["minimum_installed_version"],
+                  "firmware_url": firmware["browser_download_url"],
+                  "sha256": whole_hash,
+                  "image_sha256": image_hash,
+                  "mandatory": inputs["mandatory"],
+                  "notes": inputs["release_notes"],
+              }
+              metadata_bytes = (json.dumps(metadata, ensure_ascii=False, indent=2) + "\n").encode()
+              Path("latest.json").write_bytes(metadata_bytes)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write(f"Validated {tag}: {len(firmware_data):,} bytes\n\n"
+                                f"File SHA-256: `{whole_hash}`\n\n"
+                                f"ESP image SHA-256: `{image_hash}`\n\n"
+                                f"Mode: {'publish' if inputs['publish'] else 'dry run (no release writes)'}\n")
+              if not inputs["publish"]:
+                  return
+
+              def verify_firmware(assets):
+                  current = one_asset(assets, FIRMWARE)
+                  require(current["id"] == firmware["id"], "Firmware asset was replaced")
+                  require(current["browser_download_url"] == metadata["firmware_url"],
+                          "Firmware URL changed")
+                  require(download(current) == firmware_data, "Firmware changed after validation")
+
+              get_draft()
+              assets = asset_list()
+              verify_firmware(assets)
+              existing = [a for a in assets if a["name"] == "latest.json"]
+              if existing:
+                  # Safe retry after a partial run; never silently overwrite metadata.
+                  latest = one_asset(assets, "latest.json")
+                  require(download(latest) == metadata_bytes,
+                          "Draft already has different latest.json; remove it manually before retrying")
+              else:
+                  current = get_draft()
+                  upload_url = current["upload_url"].split("{", 1)[0] + "?name=latest.json"
+                  api(upload_url, method="POST", upload="latest.json")
+
+              # Verify BOTH draft assets before the irreversible publish operation.
+              get_draft()
+              assets = asset_list()
+              verify_firmware(assets)
+              latest = one_asset(assets, "latest.json")
+              require(download(latest) == metadata_bytes, "Uploaded latest.json mismatch")
+              get_draft()
+              api(release_path, method="PATCH", payload={"draft": False, "make_latest": "true"})
+
+              # Re-fetch and re-download published assets, with bounded propagation retries.
+              for attempt in range(6):
+                  try:
+                      published = api(release_path)
+                      require(published["draft"] is False and published["tag_name"] == tag,
+                              "Published release state mismatch")
+                      assets = asset_list()
+                      verify_firmware(assets)
+                      published_latest = one_asset(assets, "latest.json")
+                      require(published_latest["id"] == latest["id"], "Metadata asset was replaced")
+                      require(download(published_latest) == metadata_bytes, "Published metadata mismatch")
+                      break
+                  except (ValueError, subprocess.CalledProcessError):
+                      if attempt == 5:
+                          raise
+                      time.sleep(10)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write("\nPublished release and both asset contents verified.\n")
+
+          if __name__ == "__main__":
+              main()
+          PY
