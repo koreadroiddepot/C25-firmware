@@ -3,10 +3,10 @@
   "product": "C25",
   "hardware_revision": "C25-REV-B",
   "storage_layout": "C25-AUDIO512-V1",
-  "version": "1.0.0",
-  "min_firmware_version": "0.11.8",
-  "url": "https://github.com/koreadroiddepot/C25-firmware/releases/download/v0.11.8/c25-audio.bin",
+  "version": "1.1.0",
+  "min_firmware_version": "0.11.9",
+  "url": "https://github.com/koreadroiddepot/C25-firmware/releases/download/v0.11.9/c25-audio.bin",
   "size": 524288,
-  "sha256": "ef43a2f24bfe46056d2877b88d4ffb1d47537865f91fa5c7b26f76e6d3fcbecf",
-  "notes": "C25 original sound pack. Reinstalls the existing three effects. If an update fails, reconnect and reinstall this pack to recover. Boot and Bluetooth cues are unchanged."
+  "sha256": "087238a87ab51ddc9ecc03d8100482a621f151fb330d78dfb1c7a8a0ee79947c",
+  "notes": "Adds the 7.92-second Mandalorian engage option alongside KDD Original. Install firmware 0.11.9 or later, then select the engage version in device settings. Original effects and the 512 KiB partition are preserved. Reinstall this pack to recover an interrupted transfer."
 }
