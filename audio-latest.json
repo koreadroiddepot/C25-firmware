@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "product": "C25",
+  "hardware_revision": "C25-REV-B",
+  "storage_layout": "C25-AUDIO512-V1",
+  "version": "1.0.0",
+  "min_firmware_version": "0.11.8",
+  "url": "https://github.com/koreadroiddepot/C25-firmware/releases/download/v0.11.8/c25-audio.bin",
+  "size": 524288,
+  "sha256": "ef43a2f24bfe46056d2877b88d4ffb1d47537865f91fa5c7b26f76e6d3fcbecf",
+  "notes": "C25 original sound pack. Reinstalls the existing three effects. If an update fails, reconnect and reinstall this pack to recover. Boot and Bluetooth cues are unchanged."
+}
